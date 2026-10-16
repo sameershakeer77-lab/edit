@@ -1,0 +1,254 @@
+import sqlite3
+import json
+import re
+import math
+from collections import Counter
+import urllib.request
+import urllib.parse
+from bs4 import BeautifulSoup
+from aiohttp import web
+
+# =====================================================================
+# 1. PRIVATE LOCAL DATABASE (SQLite - 0% Leaves Your Device)
+# =====================================================================
+class AstraPrivateDB:
+    def __init__(self, db_path="astra_vault.db"):
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._setup_tables()
+
+    def _setup_tables(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                priority TEXT DEFAULT 'normal'
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS vault (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT UNIQUE,
+                value TEXT,
+                word_vector TEXT
+            )
+        """)
+        self.conn.commit()
+
+    def _vectorize(self, text):
+        words = re.findall(r'\w+', text.lower())
+        stop = {'the', 'is', 'in', 'and', 'to', 'of', 'a', 'for', 'on', 'with', 'what', 'my', 'our'}
+        return dict(Counter([w for w in words if w not in stop and len(w) > 2]))
+
+    def _cosine_similarity(self, v1, v2):
+        common = set(v1.keys()) & set(v2.keys())
+        num = sum(v1[k] * v2[k] for k in common)
+        den = math.sqrt(sum(v**2 for v in v1.values())) * math.sqrt(sum(v**2 for v in v2.values()))
+        return float(num) / den if den else 0.0
+
+    # --- CRUD TASK COMMANDS ---
+    def add_task(self, title, priority="normal"):
+        cur = self.conn.cursor()
+        cur.execute("INSERT INTO tasks (title, priority) VALUES (?, ?)", (title.strip(), priority))
+        self.conn.commit()
+        return title.strip()
+
+    def complete_task(self, keyword):
+        cur = self.conn.cursor()
+        cur.execute("UPDATE tasks SET status = 'completed' WHERE LOWER(title) LIKE ?", (f"%{keyword.lower()}%",))
+        self.conn.commit()
+        return cur.rowcount
+
+    def delete_task(self, keyword):
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM tasks WHERE LOWER(title) LIKE ?", (f"%{keyword.lower()}%",))
+        self.conn.commit()
+        return cur.rowcount
+
+    # --- VAULT MEMORY COMMANDS ---
+    def save_vault(self, topic, value):
+        vec = json.dumps(self._vectorize(f"{topic} {value}"))
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO vault (topic, value, word_vector) VALUES (?, ?, ?)
+            ON CONFLICT(topic) DO UPDATE SET value=excluded.value, word_vector=excluded.word_vector
+        """, (topic.lower().strip(), value.strip(), vec))
+        self.conn.commit()
+
+    def delete_vault(self, keyword):
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM vault WHERE LOWER(topic) LIKE ?", (f"%{keyword.lower()}%",))
+        self.conn.commit()
+        return cur.rowcount
+
+    def search_vault(self, query):
+        q_vec = self._vectorize(query)
+        cur = self.conn.cursor()
+        cur.execute("SELECT topic, value, word_vector FROM vault")
+        results = []
+        for topic, value, vec_json in cur.fetchall():
+            score = self._cosine_similarity(q_vec, json.loads(vec_json))
+            if score >= 0.25:
+                results.append({"score": round(score, 3), "topic": topic, "value": value})
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results
+
+    def get_protected_words(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT topic, value FROM vault")
+        secret_words = set()
+        for t, v in cur.fetchall():
+            for w in re.findall(r'\w+', f"{t} {v}".lower()):
+                if len(w) > 3:
+                    secret_words.add(w)
+        return secret_words
+
+    def get_dashboard_snapshot(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, title, status, priority FROM tasks ORDER BY id DESC")
+        tasks = [{"id": r[0], "title": r[1], "status": r[2], "priority": r[3]} for r in cur.fetchall()]
+        cur.execute("SELECT topic, value FROM vault ORDER BY id DESC")
+        vault = [{"topic": r[0], "value": r[1]} for r in cur.fetchall()]
+        return {"tasks": tasks, "vault": vault}
+
+
+# =====================================================================
+# 2. ONE-WAY INBOUND WEB SEARCH (WITH OUTBOUND FIREWALL)
+# =====================================================================
+class SanitizedWebSearch:
+    def search_web(self, raw_query, protected_words):
+        safe_words = [
+            w for w in raw_query.split()
+            if re.sub(r'\W+', '', w).lower() not in protected_words
+        ]
+        clean_query = " ".join(safe_words).strip()
+        if len(clean_query) < 3:
+            return ["Blocked outbound search to protect your private database terms."]
+
+        url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(clean_query)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as res:
+                soup = BeautifulSoup(res.read().decode('utf-8'), 'html.parser')
+                snippets = [s.get_text(strip=True) for s in soup.find_all('a', class_='result__snippet')[:2]]
+                return snippets if snippets else ["No web results found."]
+        except Exception:
+            return ["Outside web search is currently offline."]
+
+
+# =====================================================================
+# 3. YOUR CUSTOM THINKING & COMMAND ENGINE
+# =====================================================================
+class AstraBrain:
+    def __init__(self):
+        self.db = AstraPrivateDB()
+        self.web = SanitizedWebSearch()
+        self.local_llm_url = "http://127.0.0.1:8081/v1/chat/completions"
+
+    def process_command(self, text):
+        # Break compound sentences ("add task X and then set Y to Z") into sequential actions
+        steps = [s.strip() for s in re.split(r'\band then\b|\balso\b|;', text, flags=re.I) if s.strip()]
+        responses = []
+
+        for step in steps:
+            low = step.lower()
+
+            # 1. ADD TASK
+            if re.search(r'\b(add task|create task|remind me to)\b', low):
+                title = re.sub(r'^.*?(add task|create task|remind me to)\s*(to\s*)?', '', step, flags=re.I).strip()
+                prio = "high" if ("urgent" in low or "high" in low) else "normal"
+                saved = self.db.add_task(title, prio)
+                responses.append(f"Added task {saved} with {prio} priority.")
+
+            # 2. COMPLETE TASK
+            elif re.search(r'\b(complete task|mark task|finish task)\b', low):
+                kw = re.sub(r'\b(complete|mark|finish|task|as|done|completed)\b', '', low).strip()
+                count = self.db.complete_task(kw)
+                responses.append(f"Marked {kw} as completed." if count else f"Could not find task {kw}.")
+
+            # 3. DELETE TASK
+            elif re.search(r'\b(delete task|remove task)\b', low):
+                kw = re.sub(r'^.*?(delete task|remove task)\s*', '', step, flags=re.I).strip()
+                count = self.db.delete_task(kw)
+                responses.append(f"Deleted task {kw}." if count else f"No task matching {kw} found.")
+
+            # 4. LIST TASKS
+            elif re.search(r'\b(list tasks|my tasks|pending tasks|what are my tasks)\b', low):
+                snap = self.db.get_dashboard_snapshot()["tasks"]
+                pending = [t["title"] for t in snap if t["status"] == "pending"]
+                if pending:
+                    responses.append(f"You have {len(pending)} pending tasks: " + ", ".join(pending) + ".")
+                else:
+                    responses.append("You have no pending tasks right now.")
+
+            # 5. SAVE TO PRIVATE VAULT ("set X to Y", "remember that X is Y", "save X as Y")
+            elif re.search(r'\b(remember that|set|update|save)\b.*?\b(is|to|as)\b', low):
+                m = re.search(r'(?:remember that|set|update|save)\s+(.+?)\s+(?:is|to|as)\s+(.+)', step, flags=re.I)
+                if m:
+                    topic, val = m.group(1).strip(), m.group(2).strip()
+                    self.db.save_vault(topic, val)
+                    responses.append(f"Saved to private vault: {topic} is set to {val}.")
+
+            # 6. DELETE FROM VAULT ("delete record X", "forget X")
+            elif re.search(r'\b(delete record|forget)\b', low):
+                kw = re.sub(r'^.*?(delete record|forget)\s*', '', step, flags=re.I).strip()
+                count = self.db.delete_vault(kw)
+                responses.append(f"Removed {kw} from your vault." if count else f"Nothing matching {kw} in vault.")
+
+            # 7. THINKING SEARCH: Check Private Vault FIRST -> Fallback to Sanitized Web Search
+            else:
+                vault_hits = self.db.search_vault(step)
+                if vault_hits:
+                    best = vault_hits[0]
+                    responses.append(f"According to your private vault, {best['topic']} is {best['value']}.")
+                else:
+                    protected = self.db.get_protected_words()
+                    web_facts = self.web.search_web(step, protected)
+                    responses.append(f"From outside search: {web_facts[0]}")
+
+        return " ".join(responses)
+
+
+# =====================================================================
+# 4. UNIFIED HTTP + WEBSOCKET SERVER (Port 8080)
+# =====================================================================
+brain = AstraBrain()
+
+async def index_handler(request):
+    return web.FileResponse('./index.html')
+
+async def websocket_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    
+    # Send initial database state as soon as UI connects
+    await ws.send_json({"type": "db_sync", "data": brain.db.get_dashboard_snapshot()})
+
+    async for msg in ws:
+        if msg.type == web.WSMsgType.TEXT:
+            payload = json.loads(msg.data)
+            if payload.get("type") == "voice_command":
+                user_text = payload.get("text", "").strip()
+                print(f"[Voice Input]: {user_text}")
+                
+                reply = brain.process_command(user_text)
+                print(f"[AI Output]:   {reply}")
+                
+                await ws.send_json({
+                    "type": "ai_reply",
+                    "text": reply,
+                    "db": brain.db.get_dashboard_snapshot()
+                })
+    return ws
+
+app = web.Application()
+app.router.add_get('/', index_handler)
+app.router.add_get('/ws', websocket_handler)
+
+if __name__ == '__main__':
+    print("====================================================")
+    print("🚀 Custom AI Server Running at: http://localhost:8080")
+    print("====================================================")
+    web.run_app(app, host='127.0.0.1', port=8080)
